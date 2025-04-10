@@ -700,7 +700,7 @@ static int _handle_connection(conmgr_fd_t *con, handle_connection_args_t *args)
 		con_unset_flag(con, FLAG_CAN_READ);
 
 		if (list_count(mgr.connections) >= mgr.max_connections) {
-			log_flag(CONMGR, "%s: [%s] Deferring incoming connection due to %d/%d connections",
+			warning("%s: [%s] Deferring incoming connection due to %d/%d connections",
 				 __func__, con->name,
 				 list_count(mgr.connections),
 				 mgr.max_connections);
@@ -738,10 +738,11 @@ static int _handle_connection(conmgr_fd_t *con, handle_connection_args_t *args)
 		/* must wait until poll allows read from this socket */
 		if (con_flag(con, FLAG_IS_LISTEN)) {
 			if (list_count(mgr.connections) >= mgr.max_connections) {
-				log_flag(CONMGR, "%s: [%s] Deferring polling for new connections due to %d/%d connections",
+				warning("%s: [%s] Deferring polling for new connections due to %d/%d connections",
 					 __func__, con->name,
 					 list_count(mgr.connections),
 					 mgr.max_connections);
+
 				con_set_polling(con, PCTL_TYPE_CONNECTED,
 						__func__);
 			} else {
@@ -872,14 +873,20 @@ static void _listen_accept(conmgr_callback_args_t conmgr_args, void *arg)
 	conmgr_fd_t *con = conmgr_args.con;
 	slurm_addr_t addr = {0};
 	socklen_t addrlen = sizeof(addr);
-	int fd, rc;
+	int input_fd = -1, fd = -1, rc = EINVAL;
 	const char *unix_path = NULL;
+	conmgr_con_type_t type = CON_TYPE_INVALID;
+	con_flags_t flags = FLAG_NONE;
 
-	if (con->input_fd == -1) {
+	slurm_mutex_lock(&mgr.mutex);
+
+	if ((input_fd = con->input_fd) < 0) {
+		slurm_mutex_unlock(&mgr.mutex);
 		log_flag(CONMGR, "%s: [%s] skipping accept on closed connection",
 			 __func__, con->name);
 		return;
 	} else if (con_flag(con, FLAG_QUIESCE)) {
+		slurm_mutex_unlock(&mgr.mutex);
 		log_flag(CONMGR, "%s: [%s] skipping accept on quiesced connection",
 			 __func__, con->name);
 		return;
@@ -887,9 +894,14 @@ static void _listen_accept(conmgr_callback_args_t conmgr_args, void *arg)
 		log_flag(CONMGR, "%s: [%s] attempting to accept new connection",
 			 __func__, con->name);
 
+	type = con->type;
+	flags = con->flags;
+
+	slurm_mutex_unlock(&mgr.mutex);
+
 	/* try to get the new file descriptor and retry on errors */
-	if ((fd = accept4(con->input_fd, (struct sockaddr *) &addr,
-			  &addrlen, SOCK_CLOEXEC)) < 0) {
+	if ((fd = accept4(input_fd, (struct sockaddr *) &addr, &addrlen,
+			  SOCK_CLOEXEC)) < 0) {
 		if (errno == EINTR) {
 			log_flag(CONMGR, "%s: [%s] interrupt on accept(). Retrying.",
 				 __func__, con->name);
@@ -923,12 +935,29 @@ static void _listen_accept(conmgr_callback_args_t conmgr_args, void *arg)
 		      __func__, addrlen);
 
 	if (addr.ss_family == AF_UNIX) {
-		const struct sockaddr_un *usock = (struct sockaddr_un *) &addr;
+		struct sockaddr_un *usock = (struct sockaddr_un *) &addr;
 
 		xassert(usock->sun_family == AF_UNIX);
 
-		if (!usock->sun_path[0] && (con->address.ss_family == AF_LOCAL))
-			usock = (struct sockaddr_un *) &con->address;
+		if (!usock->sun_path[0]) {
+			/*
+			 * Attempt to use parent socket's path.
+			 * Need to lock to access con->address safely.
+			 */
+			slurm_mutex_lock(&mgr.mutex);
+
+			if (con->address.ss_family == AF_UNIX) {
+				struct sockaddr_un *psock =
+					(struct sockaddr_un *) &con->address;
+
+				if (psock->sun_path[0])
+					(void) memcpy(&usock->sun_path,
+						      &psock->sun_path,
+						      sizeof(usock->sun_path));
+			}
+
+			slurm_mutex_unlock(&mgr.mutex);
+		}
 
 		/* address may not be populated by kernel */
 		if (usock->sun_path[0])
@@ -943,9 +972,9 @@ static void _listen_accept(conmgr_callback_args_t conmgr_args, void *arg)
 	}
 
 	/* hand over FD for normal processing */
-	if ((rc = add_connection(con->type, con, fd, fd, con->events,
-				 (conmgr_con_flags_t) con->flags, &addr,
-				 addrlen, false, unix_path, con->new_arg))) {
+	if ((rc = add_connection(type, con, fd, fd, con->events,
+				 (conmgr_con_flags_t) flags, &addr, addrlen,
+				 false, unix_path, con->new_arg))) {
 		log_flag(CONMGR, "%s: [fd:%d] unable to a register new connection: %s",
 			 __func__, fd, slurm_strerror(rc));
 		return;
@@ -975,10 +1004,17 @@ static void _inspect_connections(conmgr_callback_args_t conmgr_args, void *arg)
 	mgr.watch_max_sleep = (struct timespec) {0};
 	args.time = timespec_now();
 
-	if (list_transfer_match(mgr.listen_conns, mgr.complete_conns,
+	/*
+	 * Always check mgr.connections list first to avoid
+	 * _is_accept_deferred() returning a different answer which could result
+	 * in listeners not being set to PCTL_TYPE_LISTEN after enough
+	 * connections were closed to fall below the max connection count.
+	 */
+
+	if (list_transfer_match(mgr.connections, mgr.complete_conns,
 				_list_transfer_handle_connection, &args))
 		send_signal = true;
-	if (list_transfer_match(mgr.connections, mgr.complete_conns,
+	if (list_transfer_match(mgr.listen_conns, mgr.complete_conns,
 				_list_transfer_handle_connection, &args))
 		send_signal = true;
 
@@ -1301,6 +1337,18 @@ static bool _watch_loop(void)
 					   &mgr.mutex);
 
 			log_flag(CONMGR, "%s: END: quiesced state", __func__);
+
+			/*
+			 * All the worker threads may be waiting for a
+			 * worker_sleep event and not an on_start_quiesced
+			 * event. Wake them all up right now if there is any
+			 * pending work queued to avoid workers remaining
+			 * sleeping until add_work() is called enough times to
+			 * wake them all up independent of the size of the
+			 * mgr.work queue.
+			 */
+			if (!list_is_empty(mgr.work))
+				EVENT_BROADCAST(&mgr.worker_sleep);
 		}
 	}
 

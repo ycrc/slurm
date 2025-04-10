@@ -455,10 +455,11 @@ extern int load_all_node_state ( bool state_only )
 					node_state_rec->node_hostname);
 			}
 			if (IS_NODE_FUTURE(node_ptr) &&
-			    (node_state & NODE_STATE_DYNAMIC_FUTURE)) {
-				/* Preserve active dynamic future node state */
-				node_ptr->node_state    = node_state;
-
+			    ((node_state & NODE_STATE_DYNAMIC_FUTURE) ||
+			     (slurm_conf.reconfig_flags &
+			      RECONFIG_KEEP_NODE_STATE_FUTURE))) {
+				/* preserve state for conf FUTURE nodes */
+				node_ptr->node_state = node_state;
 			} else if (IS_NODE_CLOUD(node_ptr)) {
 				if ((!power_save_mode) &&
 				    ((node_state & NODE_STATE_POWERED_DOWN) ||
@@ -3020,6 +3021,10 @@ static int _set_gpu_spec(node_record_t *node_ptr, char **reason_down)
 		/* info("%d has %s", i, */
 		/*      bit_fmt_full(gres_ns->topo_core_bitmap[i])); */
 		for (int j = 0; j < node_ptr->tot_cores; j++) {
+			/* Skip general spec cores */
+			if (node_ptr->node_spec_bitmap &&
+			    !bit_test(node_ptr->node_spec_bitmap, j))
+				continue;
 			/* Only look at the ones set */
 			if (!bit_test(gres_ns->topo_core_bitmap[i], j))
 				continue;

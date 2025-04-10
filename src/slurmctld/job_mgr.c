@@ -3513,6 +3513,7 @@ extern job_record_t *job_array_split(job_record_t *job_ptr, bool list_add)
 	job_ptr_pend->node_bitmap = NULL;
 	job_ptr_pend->node_bitmap_cg = NULL;
 	job_ptr_pend->node_bitmap_pr = NULL;
+	job_ptr_pend->node_bitmap_preempt = NULL;
 	job_ptr_pend->nodes = NULL;
 	job_ptr_pend->nodes_completing = NULL;
 	job_ptr_pend->nodes_pr = NULL;
@@ -4857,7 +4858,7 @@ static void _apply_signal_jobs_filter(job_record_t *job_ptr,
 
 	/* Verify that the user can kill the requested job */
 	if ((job_ptr->user_id != auth_uid) &&
-	    !validate_operator(auth_uid) &&
+	    !validate_operator_locked(auth_uid) &&
 	    !assoc_mgr_is_user_acct_coord(acct_db_conn, auth_uid,
 					  job_ptr->account, true)) {
 		slurm_selected_step_t *use_id;
@@ -6946,18 +6947,23 @@ extern int job_limits_check(job_record_t **job_pptr, bool check_min_time)
 			job_desc.cpus_per_task = 1;
 		else
 			job_desc.cpus_per_task = detail_ptr->orig_cpus_per_task;
-		if (detail_ptr->num_tasks)
-			job_desc.num_tasks = detail_ptr->num_tasks;
-		else {
-			job_desc.num_tasks = job_desc.min_nodes;
-			if (detail_ptr->ntasks_per_node != NO_VAL16)
-				job_desc.num_tasks *=
-					detail_ptr->ntasks_per_node;
-		}
+		/*
+		 * Passing the value directly since detail_ptr->num_tasks
+		 * already set correctly. If it is zero _valid_pn_min_mem()
+		 * already handles it.
+		 */
+		job_desc.num_tasks = detail_ptr->num_tasks;
 		//job_desc.min_cpus = detail_ptr->min_cpus; /* init'ed above */
 		job_desc.max_cpus = detail_ptr->orig_max_cpus;
 		job_desc.shared = (uint16_t)detail_ptr->share_res;
-		job_desc.ntasks_per_node = detail_ptr->ntasks_per_node;
+		/*
+		 * At this point detail_ptr->ntasks_per_node is expected to
+		 * hold 0 (not set) or a regular value, but never NO_VAL16.
+		 * _valid_pn_min_mem will check for job_desc.ntasks_per_node
+		 * being different than NO_VAL16, which is its initial value.
+		 */
+		if (detail_ptr->ntasks_per_node)
+			job_desc.ntasks_per_node = detail_ptr->ntasks_per_node;
 		job_desc.ntasks_per_tres = detail_ptr->ntasks_per_tres;
 		job_desc.pn_min_cpus = detail_ptr->orig_pn_min_cpus;
 		job_desc.job_id = job_ptr->job_id;
@@ -7747,7 +7753,7 @@ static void _figure_out_num_tasks(
 			job_desc->num_tasks = num_tasks;
 			job_desc->bitflags |= TASKS_CHANGED;
 		}
-	} else if (num_tasks != NO_VAL) {
+	} else if (num_tasks != job_desc->num_tasks) {
 		job_desc->num_tasks = num_tasks;
 		job_desc->bitflags |= TASKS_CHANGED;
 	}
@@ -8881,15 +8887,60 @@ static bool _valid_pn_min_mem(job_desc_msg_t *job_desc_msg,
 
 		if ((job_desc_msg->pn_min_cpus == NO_VAL16) ||
 		    (job_desc_msg->pn_min_cpus < min_cpus)) {
-			debug("JobId=%u: Setting job's pn_min_cpus to %u due to memory limit",
-			      job_desc_msg->job_id, min_cpus);
 			job_desc_msg->pn_min_cpus = min_cpus;
+			if (min_cpus > job_desc_msg->min_cpus) {
+				job_desc_msg->min_cpus = min_cpus;
+				job_desc_msg->max_cpus =
+					MAX(min_cpus, job_desc_msg->max_cpus);
+			}
 			cpus_per_node = MAX(cpus_per_node, min_cpus);
-			if (job_desc_msg->ntasks_per_node)
+			if (job_desc_msg->ntasks_per_node != NO_VAL16) {
 				job_desc_msg->cpus_per_task =
 					(job_desc_msg->pn_min_cpus +
 					 job_desc_msg->ntasks_per_node - 1) /
 					job_desc_msg->ntasks_per_node;
+				job_desc_msg->pn_min_cpus =
+					MAX(job_desc_msg->cpus_per_task *
+					    job_desc_msg->ntasks_per_node,
+					    job_desc_msg->pn_min_cpus);
+			} else if (job_desc_msg->num_tasks &&
+				   (job_desc_msg->num_tasks != NO_VAL) &&
+				   job_desc_msg->min_nodes &&
+				   (job_desc_msg->min_nodes != NO_VAL)) {
+				/*
+				 * Calculate a new value of cpus/task given the
+				 * current nodes and tasks values:
+				 * CPUs/Task = (min_cpus_per_node * min_nodes) / num_tasks
+				 */
+				uint32_t cpus =
+					min_cpus * job_desc_msg->min_nodes;
+				job_desc_msg->cpus_per_task =
+					ROUNDUP(cpus, job_desc_msg->num_tasks);
+				/*
+				 * Recalculate pn_min_cpus based on the new
+				 * CPUs/task. This formula aims to get
+				 * an allocation with the least amount of
+				 * CPUs combining all the nodes from the job.
+				 */
+				min_cpus = (job_desc_msg->cpus_per_task *
+					    job_desc_msg->num_tasks) /
+					   job_desc_msg->min_nodes;
+				job_desc_msg->pn_min_cpus = min_cpus;
+				job_desc_msg->min_cpus =
+					MAX(min_cpus,
+					    job_desc_msg->pn_min_cpus);
+			} else if (!job_desc_msg->num_tasks) {
+				/*
+				 * The job did not request any amount of tasks
+				 * explicitly. Assuming 1 per node.
+				 */
+				job_desc_msg->cpus_per_task =
+					MAX(job_desc_msg->pn_min_cpus,
+					    job_desc_msg->cpus_per_task);
+			}
+			debug("JobId=%u: Setting job's pn_min_cpus to %u due to memory limit",
+			      job_desc_msg->job_id,
+			      job_desc_msg->pn_min_cpus);
 		}
 		sys_mem_limit *= cpus_per_node;
 	}

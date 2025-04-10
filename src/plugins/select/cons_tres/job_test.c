@@ -661,17 +661,6 @@ static avail_res_t *_can_job_run_on_node(job_record_t *job_ptr,
 			if (job_ptr->details->cpus_per_task > 1) {
 				i = cpus % job_ptr->details->cpus_per_task;
 				cpus -= i;
-				/*
-				 * Do not ask for more cpus than the minimum
-				 * required. Higher values will cause the
-				 * avail_res_cnt to be higher than needed.
-				 * This prevents the topology plugin to
-				 * filter out some valid nodes later on.
-				*/
-				if ((cpus > min_cpus_per_node) &&
-				    (job_ptr->details->max_nodes != 0) &&
-				    (job_ptr->details->min_nodes != 0))
-					cpus = min_cpus_per_node;
 			}
 			if (cpus < job_ptr->details->ntasks_per_node)
 				cpus = 0;
@@ -2079,6 +2068,16 @@ alloc_job:
 	 * checks are accurate later on.
 	 */
 	if (mode != SELECT_MODE_RUN_NOW) {
+		/*
+		 * In the cases where we are evaluating a preemptor job,
+		 * we need to save a copy of the assigned node_bitmap so
+		 * we have enough information to accurately determine
+		 * if we are not breaking accounting policy limits later on.
+		 */
+		FREE_NULL_BITMAP(job_ptr->node_bitmap_preempt);
+		job_ptr->node_bitmap_preempt =
+			bit_copy(job_ptr->job_resrcs->node_bitmap);
+
 		/*
 		 * If we are a reservation the job_id == 0, we don't want to
 		 * free job_resrcs here.

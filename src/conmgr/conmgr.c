@@ -66,6 +66,12 @@ static void _atfork_child(void)
 	enabled_status = false;
 }
 
+static void _at_exit(void)
+{
+	/* Skip locking mgr.mutex to avoid a deadlock */
+	mgr.shutdown_requested = true;
+}
+
 extern void conmgr_init(int thread_count, int max_connections,
 			conmgr_callbacks_t callbacks)
 {
@@ -144,7 +150,7 @@ extern void conmgr_init(int thread_count, int max_connections,
 	slurm_mutex_unlock(&mgr.mutex);
 
 	/* Hook into atexit() in always clean shutdown if exit() called */
-	(void) atexit(conmgr_request_shutdown);
+	(void) atexit(_at_exit);
 }
 
 extern void conmgr_fini(void)
@@ -407,6 +413,15 @@ extern void conmgr_unquiesce(const char *caller)
 	mgr.quiesce.active = false;
 
 	EVENT_BROADCAST(&mgr.quiesce.on_stop_quiesced);
+
+	/*
+	 * If watch() never gets to an active quiesce then watch() may not be
+	 * waiting on on_stop_quiesced event before conmgr_unquiesce() is
+	 * called. Then watch() could still be waiting for a watch_sleep event
+	 * and not a on_stop_quiesced event which could result it in never
+	 * waking up.
+	 */
+	EVENT_SIGNAL(&mgr.watch_sleep);
 
 	slurm_mutex_unlock(&mgr.mutex);
 }
