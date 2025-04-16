@@ -38,6 +38,9 @@
 
 #include "src/slurmctld/slurmctld.h"
 
+extern void jobcomp_common_conf_init(void);
+extern void jobcomp_common_conf_fini(void);
+
 extern buf_t *jobcomp_common_load_state_file(char *state_file);
 extern data_t *jobcomp_common_job_record_to_data(job_record_t *job_ptr);
 
