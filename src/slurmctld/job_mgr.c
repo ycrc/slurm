@@ -13627,15 +13627,6 @@ static int _update_job(job_record_t *job_ptr, job_desc_msg_t *job_desc,
 			xfree(job_ptr->state_desc);
 		}
 
-		/*
-		 * The update did not explicit a time limit, but did
-		 * explicit a new QoS. Now that we have changed the QoS, we are
-		 * sure that we can use whatever is set in its QoS limits to set
-		 * the final job's time limit later.
-		 */
-		if (job_desc->time_limit == NO_VAL)
-			job_desc->time_limit = new_qos_ptr->max_wall_pj;
-
 		info("%s: setting QOS to %s for %pJ",
 		     __func__, detail_ptr->qos_req, job_ptr);
 	}
@@ -13679,6 +13670,7 @@ static int _update_job(job_record_t *job_ptr, job_desc_msg_t *job_desc,
 	if (new_qos_ptr || new_assoc_ptr || new_part_ptr) {
 		update_accounting = true;
 		acct_policy_add_job_submit(job_ptr, false);
+		acct_policy_update_pending_job(job_ptr, false);
 	}
 
 	if (new_resv_ptr) {
@@ -17774,6 +17766,7 @@ static int _job_requeue_op(uid_t uid, job_record_t *job_ptr, bool preempt,
 	static bool requeue_nohold_prolog = true;
 	bool is_running = false, is_suspended = false, is_completed = false;
 	bool is_completing = false;
+	bool requeue_fini_called = false;
 	bool force_requeue = false;
 	time_t now = time(NULL);
 	uint32_t completing_flags = 0;
@@ -17928,7 +17921,8 @@ static int _job_requeue_op(uid_t uid, job_record_t *job_ptr, bool preempt,
 	 */
 	if (is_running) {
 		job_state_set_flag(job_ptr, JOB_COMPLETING);
-		deallocate_nodes(job_ptr, false, is_suspended, preempt);
+		requeue_fini_called =
+			deallocate_nodes(job_ptr, false, is_suspended, preempt);
 		if (!IS_JOB_COMPLETING(job_ptr) && !job_ptr->fed_details)
 			is_completed = true;
 		else
@@ -17975,7 +17969,7 @@ reply:
 	 */
 	acct_policy_add_job_submit(job_ptr, false);
 
-	acct_policy_update_pending_job(job_ptr);
+	acct_policy_update_pending_job(job_ptr, true);
 
 	if (flags & JOB_SPECIAL_EXIT) {
 		job_state_set_flag(job_ptr, JOB_SPECIAL_EXIT);
@@ -18025,7 +18019,7 @@ reply:
 	 * Call batch_requeue_fini after setting priority to 0 for requeue_hold
 	 * and special_exit so federation doesn't submit siblings for held job.
 	 */
-	if (is_completed)
+	if (is_completed && !requeue_fini_called)
 		batch_requeue_fini(job_ptr);
 
 	debug("%s: %pJ state 0x%x reason %u priority %d",

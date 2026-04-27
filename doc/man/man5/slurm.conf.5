@@ -499,10 +499,10 @@ If not set, the default key file is jwt_hs256.key in \fIStateSaveLocation\fR.
 
 .TP
 \fBuserclaimfield\fR=
-Use an alternative claim field for the Slurm UserName \fBsun\fR field. This
+Use an alternative claim field for the Slurm UserName (\fBsun\fR) field. This
 option is designed to allow compatibility with tokens generated outside of
 Slurm. (This field may also be known as a grant.)
-.NR
+
 Default: (disabled)
 .RE
 .IP
@@ -561,7 +561,9 @@ components.
 All Slurm daemons and commands must be terminated prior to changing
 the value of \fBAuthType\fR and later restarted.
 Changes to this value will interrupt outstanding job steps and prevent them
-from completing.
+from completing, so no jobs should be running when this is changed.
+See <https://slurm.schedmd.com/authentication.html> for more information.
+
 Acceptable values at present:
 .RS
 .TP
@@ -5480,8 +5482,7 @@ The port number that the Slurm controller, \fBslurmctld\fR, listens
 to for work. The default value is SLURMCTLD_PORT as established at system
 build time. If none is explicitly specified, it will be set to 6817.
 \fBSlurmctldPort\fR may also be configured to support a range of port
-numbers in order to accept larger bursts of incoming messages by specifying
-two numbers separated by a dash (e.g. \fBSlurmctldPort=6817\-6818\fR).
+numbers for existing legacy configurations.
 \fBNOTE\fR: Either \fBslurmctld\fR and \fBslurmd\fR daemons must not
 execute on the same nodes or the values of \fBSlurmctldPort\fR and
 \fBSlurmdPort\fR must be different.
@@ -5689,7 +5690,7 @@ Specify the maximum number of connections to be processed at any given time.
 This does not influence the maximum number of pending connections as that is
 controlled by the kernel. Increasing this value will increase \fBslurmd\fR's
 memory footprint. Sites are advised to monitor memory consumption when
-increasing this value. Defaults to 150.
+increasing this value. Defaults to 50.
 .IP
 
 .TP
@@ -5760,9 +5761,9 @@ If set, the Slurmd will shut itself down when a reboot request is received.
 
 .TP
 \fBcontain_spank\fR
-If set and a job_container plugin is specified, the spank_user(),
-spank_task_post_fork() and spank_task_exit() calls will be run inside the job
-container.
+If set and a namespace plugin is specified, the spank_user(),
+spank_task_post_fork() and spank_task_exit() calls will be run inside the job's
+namespace.
 .RE
 .IP
 
@@ -7561,8 +7562,10 @@ The default value is "NO".
 
 .TP
 \fBDefaultTime\fR
-Run time limit used for jobs that don't specify a value. If not set
-then MaxTime will be used.
+Run time limit used for jobs that don't specify a value. If not set, the
+default will be set to an applicable time limit, which may be from the
+partition (MaxTime) or from a QOS or association (MaxWall or GrpWall).
+Regardless, MaxTime will still be enforced.
 Format is the same as for MaxTime.
 .IP
 
