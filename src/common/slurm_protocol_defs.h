@@ -207,9 +207,10 @@
 #define HOUR_SECONDS (HOUR_MINUTES * MINUTE_SECONDS)
 #define DAY_HOURS 24
 #define DAY_MINUTES (DAY_HOURS * HOUR_MINUTES)
+#define DAY_SECONDS (DAY_HOURS * HOUR_SECONDS)
 #define YEAR_DAYS 365
-#define YEAR_MINUTES (YEAR_DAYS * DAY_HOURS * HOUR_MINUTES)
-#define YEAR_SECONDS (YEAR_DAYS * DAY_HOURS * HOUR_SECONDS)
+#define YEAR_MINUTES (YEAR_DAYS * DAY_MINUTES)
+#define YEAR_SECONDS (YEAR_DAYS * DAY_SECONDS)
 
 /* Read as 'how many X are in a Y' */
 #define MSEC_IN_SEC 1000
@@ -281,6 +282,7 @@ typedef struct forward_struct {
 	char *buf;
 	int buf_len;
 	uint16_t fwd_cnt;
+	int thread_count;
 	pthread_mutex_t forward_mutex;
 	pthread_cond_t notify;
 	list_t *ret_list;

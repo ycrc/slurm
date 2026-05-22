@@ -3922,6 +3922,14 @@ static int _kill_step_on_node(void *x, void *arg)
 	if (!bit_test(step_ptr->step_node_bitmap, bit_position))
 		return 0;
 
+	/*
+	 * Don't let the batch step go through partial completion and get marked
+	 * for deallocation while the job is still running. The batch step will
+	 * be cleaned up when the job completes or is requeued.
+	 */
+	if (step_ptr->step_id.step_id == SLURM_BATCH_SCRIPT)
+		return 0;
+
 	/* Remove step allocation from the job's allocation */
 	step_node_inx = bit_set_count_range(step_ptr->step_node_bitmap, 0,
 					    bit_position);
@@ -4125,7 +4133,8 @@ static int _step_partial_comp(step_record_t *step_ptr,
 	bit_nset(step_ptr->exit_node_bitmap,
 		 req->range_first, req->range_last);
 
-	jobacctinfo_aggregate(step_ptr->jobacct, req->jobacct);
+	if (step_ptr->jobacct && req->jobacct)
+		jobacctinfo_aggregate(step_ptr->jobacct, req->jobacct);
 
 no_aggregate:
 	rem_nodes = bit_clear_count(step_ptr->exit_node_bitmap);
@@ -5396,6 +5405,7 @@ extern int stepmgr_get_job_sbcast_cred_msg(job_record_t *job_ptr,
 		sbcast_arg.step_id.step_id = job_ptr->next_step_id;
 	sbcast_arg.nodes = node_list; /* avoid extra copy */
 	sbcast_arg.expiration = job_ptr->end_time;
+	sbcast_arg.id = job_ptr->id;
 
 	if (!(sbcast_cred = create_sbcast_cred(&sbcast_arg, job_ptr->user_id,
 					       job_ptr->group_id,
