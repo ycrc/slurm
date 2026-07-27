@@ -886,6 +886,36 @@ static slurmdb_assoc_rec_t* _find_assoc_parent(
 	return parent;
 }
 
+static bool _use_client_ids(void)
+{
+	static bool set = false, use_client_ids = false;
+
+	if (!set) {
+		if (xstrstr(slurm_conf.authinfo, "use_client_ids"))
+			use_client_ids = true;
+		set = true;
+	}
+
+	return use_client_ids;
+}
+
+/* Caller holds the user lock. */
+static uid_t _uid_from_user_cache(char *username)
+{
+	slurmdb_user_rec_t lookup = { .uid = NO_VAL, .name = username };
+	slurmdb_user_rec_t *user_rec;
+
+	if (!assoc_mgr_user_list)
+		return NO_VAL;
+
+	user_rec = list_find_first(assoc_mgr_user_list, _list_find_user,
+				   &lookup);
+	if (user_rec)
+		return user_rec->uid;
+
+	return NO_VAL;
+}
+
 static int _set_assoc_parent_and_user(slurmdb_assoc_rec_t *assoc)
 {
 	xassert(verify_assoc_lock(ASSOC_LOCK, WRITE_LOCK));
@@ -990,11 +1020,19 @@ static int _set_assoc_parent_and_user(slurmdb_assoc_rec_t *assoc)
 		g_user_assoc_count++;
 		if (assoc->uid == NO_VAL || assoc->uid == INFINITE ||
 				assoc->uid == 0) {
-			if (uid_from_string(assoc->user, &pw_uid) !=
-			    SLURM_SUCCESS)
-				assoc->uid = NO_VAL;
-			else
+			uid_t cached_uid = NO_VAL;
+
+			/* INFINITE marks a freshly added assoc */
+			if ((assoc->uid == INFINITE) && _use_client_ids())
+				cached_uid = _uid_from_user_cache(assoc->user);
+
+			if (cached_uid != NO_VAL)
+				assoc->uid = cached_uid;
+			else if (uid_from_string(assoc->user, &pw_uid) ==
+				 SLURM_SUCCESS)
 				assoc->uid = pw_uid;
+			else
+				assoc->uid = NO_VAL;
 		}
 		_set_user_default_acct(assoc, NULL);
 
@@ -1793,16 +1831,53 @@ static int _get_assoc_mgr_qos_list(void *db_conn, int enforce)
 	return SLURM_SUCCESS;
 }
 
+/* Used to remove soon to be defunct user pointers from assoc list */
+static int _foreach_update_assoc_cached_user_rec(void *x, void *arg)
+{
+	slurmdb_assoc_rec_t *assoc = x;
+	list_t *new_user_list = arg;
+	slurmdb_user_rec_t *user = NULL;
+
+	if (assoc->user_rec) {
+		if (new_user_list)
+			user = list_find_first(new_user_list, _list_find_uid,
+					       &assoc->uid);
+		/*
+		 * If the user is NULL then the association is likely to be
+		 * removed soon by assoc_mgr_refresh_lists(), thus why this is a
+		 * debug log.
+		 */
+		if (!user)
+			debug("User with uid %u has been removed from association %u",
+			      assoc->uid, assoc->id);
+		assoc->user_rec = user;
+	}
+
+	return 0;
+}
+
 static int _get_assoc_mgr_user_list(void *db_conn, int enforce)
 {
+	list_t *current_users = NULL;
 	slurmdb_user_cond_t user_q = { .with_coords = 1 };
 	uid_t uid = getuid();
-	assoc_mgr_lock_t locks = { .user = WRITE_LOCK };
+	assoc_mgr_lock_t locks = {
+		.assoc = WRITE_LOCK, /* for updating cached user_rec in assoc */
+		.user = WRITE_LOCK,
+	};
+
+	current_users = acct_storage_g_get_users(db_conn, uid, &user_q);
 
 	assoc_mgr_lock(&locks);
+
+	if (assoc_mgr_assoc_list)
+		list_for_each(assoc_mgr_assoc_list,
+			      _foreach_update_assoc_cached_user_rec,
+			      current_users);
+
 	FREE_NULL_LIST(assoc_mgr_user_list);
 	FREE_NULL_LIST(assoc_mgr_coord_list);
-	assoc_mgr_user_list = acct_storage_g_get_users(db_conn, uid, &user_q);
+	assoc_mgr_user_list = current_users;
 
 	if (!assoc_mgr_user_list) {
 		assoc_mgr_unlock(&locks);
@@ -2051,7 +2126,10 @@ static int _refresh_assoc_mgr_user_list(void *db_conn, int enforce)
 	list_t *current_users = NULL;
 	slurmdb_user_cond_t user_q = { .with_coords = 1 };
 	uid_t uid = getuid();
-	assoc_mgr_lock_t locks = { .user = WRITE_LOCK };
+	assoc_mgr_lock_t locks = {
+		.assoc = WRITE_LOCK, /* for updating cached user_rec in assoc */
+		.user = WRITE_LOCK,
+	};
 
 	current_users = acct_storage_g_get_users(db_conn, uid, &user_q);
 
@@ -2063,6 +2141,11 @@ static int _refresh_assoc_mgr_user_list(void *db_conn, int enforce)
 	_post_user_list(current_users);
 
 	assoc_mgr_lock(&locks);
+
+	if (assoc_mgr_assoc_list)
+		list_for_each(assoc_mgr_assoc_list,
+			      _foreach_update_assoc_cached_user_rec,
+			      current_users);
 
 	FREE_NULL_LIST(assoc_mgr_user_list);
 
@@ -4525,7 +4608,6 @@ extern int assoc_mgr_update_assocs(slurmdb_update_object_t *update, bool locked)
 		while ((rec = list_next(itr)))
 			init_setup.remove_assoc_notify(rec);
 		list_iterator_destroy(itr);
-		FREE_NULL_LIST(remove_list);
 	}
 
 	if (update_list) {
@@ -4536,8 +4618,15 @@ extern int assoc_mgr_update_assocs(slurmdb_update_object_t *update, bool locked)
 		FREE_NULL_LIST(update_list);
 	}
 
+	/*
+	 * Rebuild the partition and reservation assoc lists while the removed
+	 * records are still alive (freed below), so part_update_assoc_lists()
+	 * drops the defunct pointers without a stale-pointer window.
+	 */
 	if (run_update_resvs && init_setup.update_resvs)
 		init_setup.update_resvs();
+
+	FREE_NULL_LIST(remove_list);
 
 	return rc;
 }
@@ -4548,7 +4637,7 @@ extern int assoc_mgr_update_wckeys(slurmdb_update_object_t *update, bool locked)
 	slurmdb_wckey_rec_t * object = NULL;
 	list_itr_t *itr = NULL;
 	int rc = SLURM_SUCCESS;
-	uid_t pw_uid;
+	uid_t pw_uid, cached_uid;
 	assoc_mgr_lock_t locks = { .user = WRITE_LOCK, .wckey = WRITE_LOCK };
 
 	if (!locked)
@@ -4625,14 +4714,21 @@ extern int assoc_mgr_update_wckeys(slurmdb_update_object_t *update, bool locked)
 				//rc = SLURM_ERROR;
 				break;
 			}
-			if (uid_from_string(object->user, &pw_uid) !=
-			    SLURM_SUCCESS) {
-				debug("wckey add couldn't get a uid "
-				      "for user %s",
+			cached_uid = NO_VAL;
+
+			if (_use_client_ids())
+				cached_uid = _uid_from_user_cache(object->user);
+
+			if ((cached_uid == NO_VAL) &&
+			    (uid_from_string(object->user, &pw_uid) ==
+			     SLURM_SUCCESS))
+				cached_uid = pw_uid;
+
+			if (cached_uid == NO_VAL)
+				debug("wckey add couldn't get a uid for user %s",
 				      object->user);
-				object->uid = NO_VAL;
-			} else
-				object->uid = pw_uid;
+
+			object->uid = cached_uid;
 
 			/* If is_def is uninitialized the value will
 			   be NO_VAL, so if it isn't 1 make it 0.
@@ -5525,7 +5621,7 @@ extern int assoc_mgr_validate_assoc_id(void *db_conn,
 	   the association list can be made.
 	*/
 	if (!assoc_mgr_assoc_list)
-		if (assoc_mgr_refresh_lists(db_conn, 0) == SLURM_ERROR)
+		if (assoc_mgr_refresh_lists(db_conn, 0) != SLURM_SUCCESS)
 			return SLURM_ERROR;
 
 	assoc_mgr_lock(&locks);
@@ -6365,6 +6461,7 @@ unpack_error:
 extern int assoc_mgr_refresh_lists(void *db_conn, uint16_t cache_level)
 {
 	bool partial_list = 1;
+	bool some_updated = false;
 
 	if (!cache_level) {
 		cache_level = init_setup.cache_level;
@@ -6375,39 +6472,59 @@ extern int assoc_mgr_refresh_lists(void *db_conn, uint16_t cache_level)
 	if (cache_level & ASSOC_MGR_CACHE_TRES) {
 		if (_refresh_assoc_mgr_tres_list(
 			    db_conn, init_setup.enforce) == SLURM_ERROR)
-			return SLURM_ERROR;
+			goto error;
+		some_updated = true;
 	}
 
 	/* get qos before association since it is used there */
-	if (cache_level & ASSOC_MGR_CACHE_QOS)
+	if (cache_level & ASSOC_MGR_CACHE_QOS) {
 		if (_refresh_assoc_mgr_qos_list(
 			    db_conn, init_setup.enforce) == SLURM_ERROR)
-			return SLURM_ERROR;
+			goto error;
+		some_updated = true;
+	}
 
 	/* get user before association/wckey since it is used there */
-	if (cache_level & ASSOC_MGR_CACHE_USER)
+	if (cache_level & ASSOC_MGR_CACHE_USER) {
 		if (_refresh_assoc_mgr_user_list(
 			    db_conn, init_setup.enforce) == SLURM_ERROR)
-			return SLURM_ERROR;
+			goto error;
+		some_updated = true;
+	}
 
 	if (cache_level & ASSOC_MGR_CACHE_ASSOC) {
 		if (_refresh_assoc_mgr_assoc_list(
 			    db_conn, init_setup.enforce) == SLURM_ERROR)
-			return SLURM_ERROR;
+			goto error;
+		some_updated = true;
 	}
-	if (cache_level & ASSOC_MGR_CACHE_WCKEY)
+	if (cache_level & ASSOC_MGR_CACHE_WCKEY) {
 		if (_refresh_assoc_wckey_list(
 			    db_conn, init_setup.enforce) == SLURM_ERROR)
-			return SLURM_ERROR;
-	if (cache_level & ASSOC_MGR_CACHE_RES)
+			goto error;
+		some_updated = true;
+	}
+	if (cache_level & ASSOC_MGR_CACHE_RES) {
 		if (_refresh_assoc_mgr_res_list(
 			    db_conn, init_setup.enforce) == SLURM_ERROR)
-			return SLURM_ERROR;
+			goto error;
+		some_updated = true;
+	}
 
 	if (!partial_list && _running_cache())
 		*init_setup.running_cache = RUNNING_CACHE_STATE_LISTS_REFRESHED;
 
 	return SLURM_SUCCESS;
+
+error:
+	/*
+	 * If some assoc_mgr_*_lists where updated but slurmdbd connection
+	 * lost part way through let the caller know.
+	 */
+	if (!partial_list && _running_cache() && some_updated)
+		return SLURM_COMMUNICATIONS_MISSING_SOCKET_ERROR;
+
+	return SLURM_ERROR;
 }
 
 static int _each_assoc_set_uid(void *x, void *arg)
